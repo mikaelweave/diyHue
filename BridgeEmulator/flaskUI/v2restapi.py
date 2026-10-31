@@ -815,7 +815,6 @@ class ClipV2ResourceId(Resource):
             del bridgeConfig[v1_resource][object.getObjectPath()["id"]]
             configManager.bridgeConfig.mark_dirty(v1_resource)
         else:
-            # V2 resource type (e.g. "room", "smart_scene") — map to V1 key
             del bridgeConfig[resource][resourceid]
             yaml_resource = configManager.configHandler.Config.V2_TO_V1_RESOURCE.get(resource)
             if yaml_resource:
@@ -827,6 +826,8 @@ class ClipV2ResourceId(Resource):
             configManager.bridgeConfig.save_config(backup=False, resource="behavior_instance")
         elif resource == "scene":
             configManager.bridgeConfig.save_config(backup=False, resource="scenes")
+        elif resource == "smart_scene":
+            configManager.bridgeConfig.save_config(backup=False, resource="smart_scene")
 
         response = {"data": [{
             "rid": resourceid,

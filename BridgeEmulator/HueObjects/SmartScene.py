@@ -107,6 +107,9 @@ class SmartScene():
             else:
                 setattr(self, key, value)
 
+    def getObjectPath(self):
+        return {"resource": "smart_scene", "id": self.id_v1}
+
     def save(self):
         result = {"id_v2": self.id_v2, "name": self.name, "appdata": self.appdata, "type": self.type, "image": self.image,
                   "lastupdated": self.lastupdated, "state": self.state, "group": self.group, "active_timeslot": self.active_timeslot }
