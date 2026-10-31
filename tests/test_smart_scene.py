@@ -60,6 +60,31 @@ class SmartSceneTests(unittest.TestCase):
         self.assertEqual(smart_scene.getV2Api()["state"], "inactive")
         findGroup.assert_not_called()
 
+    def test_deleting_a_smart_scene_by_uuid_requests_a_save_and_preserves_siblings(self):
+        for with_sibling in (True, False):
+            with self.subTest(with_sibling=with_sibling):
+                target = SmartScene({"name": "Natural light", "id_v1": "7",
+                                     "id_v2": "11111111-1111-4111-8111-111111111111"})
+                sibling = SmartScene({"name": "Kitchen cycle", "id_v1": "12",
+                                      "id_v2": "22222222-2222-4222-8222-222222222222"})
+                remaining = {"12": sibling} if with_sibling else {}
+                CONFIG.update({"lights": {}, "groups": {}, "scenes": {},
+                               "smart_scene": {"7": target, **remaining}})
+                with patch.object(v2restapi, "v2Resources",
+                                  {resource: {} for resource in v2restapi.v2Resources}), \
+                        patch.object(v2restapi.configManager.bridgeConfig, "save_config") as save_config, \
+                        patch.object(v2restapi.configManager.bridgeConfig, "mark_dirty"), \
+                        self.app.test_request_context(method="DELETE",
+                                                      headers={"hue-application-key": "test"}):
+                    response = self.app.make_response(
+                        v2restapi.ClipV2ResourceId().delete("smart_scene", target.id_v2))
+
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.get_json(), {
+                        "data": [{"rid": target.id_v2, "rtype": "smart_scene"}]})
+                    self.assertEqual(CONFIG["smart_scene"], remaining)
+                    save_config.assert_called_once_with(backup=False, resource="smart_scene")
+
 
 if __name__ == "__main__":
     unittest.main()
