@@ -3,11 +3,13 @@ import logManager
 import weakref
 from threading import Thread
 from datetime import datetime, timezone
-from HueObjects import genV2Uuid, StreamEvent
+from HueObjects import genV2Uuid, StreamEvent, AnnouncesDeletion
 
 logging = logManager.logger.get_logger(__name__)
 
-class Scene():
+class Scene(AnnouncesDeletion):
+    V2_TYPE = "scene"
+    V1_PREFIX = "/scenes/"
 
     DEFAULT_SPEED = 0.6269841194152832
 
@@ -39,16 +41,7 @@ class Scene():
                          }
         streamMessage["data"][0].update(self.getV2Api())
         StreamEvent(streamMessage)
-
-    def __del__(self):
-        streamMessage = {"creationtime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                         "data": [{"id": self.id_v2, "type": "scene"}],
-                         "id": str(uuid.uuid4()),
-                         "type": "delete"
-                         }
-        streamMessage["id_v1"] = "/scenes/" + self.id_v1
-        StreamEvent(streamMessage)
-        logging.info(self.name + " scene was destroyed.")
+        self._init_deletion_lifecycle()
 
     def add_light(self, light):
         self.lights.append(light)

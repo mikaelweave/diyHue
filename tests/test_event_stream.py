@@ -1,7 +1,9 @@
-import json
+import gc
+from contextvars import Context
 from pathlib import Path
 import sys
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -25,10 +27,7 @@ def message(index=0, kind="delete"):
 class ExistingRouteRegressionTests(unittest.TestCase):
     def test_connected_route_does_not_repeat_the_same_publication(self):
         app = Flask(__name__)
-        if hasattr(HueObjects, "eventstream"):
-            HueObjects.eventstream.clear()
-        with patch.object(eventStreamer, "KEEPALIVE_S", 0, create=True), \
-                patch.object(eventStreamer, "sleep", create=True), \
+        with patch.object(eventStreamer, "KEEPALIVE_S", 0), \
                 app.test_request_context("/eventstream/clip/v2"):
             response = eventStreamer.streamV2Events()
             self.addCleanup(response.close)
@@ -52,12 +51,30 @@ class EventStreamTests(unittest.TestCase):
         headers = {"hue-application-key": "PRIVATE_APP_KEY_CANARY"}
         if last_id is not None:
             headers["Last-Event-ID"] = last_id
-        with self.app.test_request_context("/eventstream/clip/v2", headers=headers):
-            response = eventStreamer.streamV2Events()
-            frames = iter(response.response)
-            self.assertEqual(next(frames), ": hi\n\n")
-        self.addCleanup(response.close)
-        return response, frames
+        context = Context()
+
+        def connect():
+            with self.app.test_request_context("/eventstream/clip/v2", headers=headers):
+                response = eventStreamer.streamV2Events()
+                frames = iter(response.response)
+                self.assertEqual(next(frames), ": hi\n\n")
+            return response, frames
+
+        response, frames = context.run(connect)
+
+        def close():
+            context.run(response.close)
+
+        def read():
+            while True:
+                try:
+                    frame = context.run(next, frames)
+                except StopIteration:
+                    return
+                yield frame
+
+        self.addCleanup(close)
+        return SimpleNamespace(close=close), read()
 
     def assert_entry(self, frames, entry):
         self.assertEqual(next(frames), f"id: {entry.sse_id}\ndata: {entry.data}\n\n")
@@ -85,15 +102,48 @@ class EventStreamTests(unittest.TestCase):
 
     def test_replay_and_oldest_minus_one_boundary(self):
         entries = [HueObjects.StreamEvent(message(n)) for n in range(4)]
-        for cursor, pending in ((entries[0], entries[1:]), (entries[1], entries[2:])):
-            response, frames = self.open(cursor.sse_id)
-            for entry in pending:
-                self.assert_entry(frames, entry)
-            live = HueObjects.StreamEvent(message(5))
-            self.assert_entry(frames, live)
-            response.close()
-            break
+        response, frames = self.open(entries[0].sse_id)
+        for entry in entries[1:]:
+            self.assert_entry(frames, entry)
+        live = HueObjects.StreamEvent(message(5))
+        self.assert_entry(frames, live)
+        response.close()
+        response, frames = self.open(entries[2].sse_id)
+        self.assert_entry(frames, entries[3])
+        self.assert_entry(frames, live)
+        response.close()
         self.assertEqual(self.journal.resume(entries[-1].sse_id).start, "replay")
+
+    def test_retained_scene_delete_reaches_connected_real_route(self):
+        import test_smart_scene as fixtures
+        from HueObjects import Scene, SmartScene
+        config = fixtures.CONFIG
+        saved = dict(config)
+        self.addCleanup(lambda: (config.clear(), config.update(saved)))
+        config.update({"apiUsers": {"test": SimpleNamespace(username="test")},
+                       "lights": {}, "groups": {}, "scenes": {}, "smart_scene": {}})
+        for rtype, store, cls in (("scene", "scenes", Scene.Scene),
+                                  ("smart_scene", "smart_scene", SmartScene.SmartScene)):
+            with self.subTest(rtype=rtype):
+                target = cls({"name": "PRIVATE_SCENE_CANARY", "id_v1": "7",
+                              "id_v2": RID, "owner": SimpleNamespace(username="test")})
+                config[store]["7"] = target
+                response, frames = self.open()
+                start = self.journal.head()
+                with patch.object(fixtures.v2restapi.configManager.bridgeConfig, "save_config"), \
+                        patch.object(fixtures.v2restapi.configManager.bridgeConfig, "mark_dirty"), \
+                        self.app.test_request_context(method="DELETE",
+                                                      headers={"hue-application-key": "test"}):
+                    deleted = self.app.make_response(
+                        fixtures.v2restapi.ClipV2ResourceId().delete(rtype, RID))
+                self.assertEqual(deleted.status_code, 200)
+                entry, = self.journal.wait_after(start, 0).entries
+                self.assertEqual(entry.message["data"], [{"id": RID, "type": rtype}])
+                self.assert_entry(frames, entry)
+                del target
+                gc.collect()
+                self.assertEqual(self.journal.head(), entry.seq)
+                response.close()
 
     def test_slow_reader_gap_closes_fast_reader_unaffected(self):
         _, slow = self.open()
@@ -115,7 +165,7 @@ class EventStreamTests(unittest.TestCase):
                  (entries[0].sse_id, "gap_evicted"),
                  ("0:1", "gap_epoch"),
                  (f"{self.journal.epoch}:999", "invalid_id"),
-                 ("PRIVATE_HEADER_CANARY\nbad", "invalid_id"),
+                 ("PRIVATE_HEADER_CANARY", "invalid_id"),
                  ("9" * 200, "invalid_id")]
         for header, classification in cases:
             with self.subTest(header=classification):
