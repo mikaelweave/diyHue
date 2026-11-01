@@ -23,7 +23,7 @@ sys.modules["configManager"] = config_manager
 
 import logManager
 logManager.logger.configure_logger("CRITICAL")
-from HueObjects import eventstream
+from HueObjects import events
 from HueObjects.Light import Light
 from HueObjects.EntertainmentConfiguration import EntertainmentConfiguration
 from HueObjects.BehaviorInstance import BehaviorInstance
@@ -45,7 +45,6 @@ class RestorationTests(unittest.TestCase):
         CONFIG["apiUsers"]["test"] = self.user
         self.app = Flask(__name__)
         self.light = self.add_light()
-        eventstream.clear()
         entertainment.lastAppliedFrame.clear()
 
     def add_light(self, model="LCT015", protocol="dummy", **state):
@@ -265,9 +264,10 @@ class RestorationTests(unittest.TestCase):
 
     def test_stop_emits_normal_light_and_inactive_area_events(self):
         self.preference("off")
-        eventstream.clear()
+        start = events.head()
         self.finish(snapshot_lights(self.group))
-        updates = [item for event in eventstream for item in event.get("data", [])]
+        updates = [item for entry in events.wait_after(start, 0).entries
+                   for item in entry.message.get("data", [])]
         light = next(item for item in updates if item["type"] == "light")
         area = next(item for item in updates if item["type"] == "entertainment_configuration")
         grouped = next(item for item in updates if item["type"] == "grouped_light")

@@ -1,12 +1,191 @@
 import uuid
 import logManager
 import random
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
+import re
+from threading import Condition, Lock, RLock
+from time import time_ns
 
 logging = logManager.logger.get_logger(__name__)
 
-eventstream = []
+
+def log_uuid(value):
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, TypeError, AttributeError):
+        return "invalid"
+
+
+def event_log(logger, level, action, **fields):
+    logger.log(level, "%s %s", action,
+               " ".join(f"{key}={value}" for key, value in fields.items()), stacklevel=2)
+
+
+@dataclass(frozen=True)
+class StreamEntry:
+    seq: int
+    sse_id: str
+    data: str
+    byte_len: int
+    kind: str
+    refs: tuple
+    event_id: str
+
+    @property
+    def message(self):
+        return json.loads(self.data)[0]
+
+
+@dataclass(frozen=True)
+class Resume:
+    cursor: int
+    start: str
+    req_seq: int | None
+    oldest_seq: int
+    head_seq: int
+    missed: int = 0
+
+
+@dataclass(frozen=True)
+class Batch:
+    entries: tuple
+    missed: int
+    oldest_seq: int
+    head_seq: int
+
+
+class EventJournal:
+    def __init__(self, *, max_events=1024, max_bytes=4 * 1024 * 1024):
+        self.epoch = time_ns()
+        self.max_events = max_events
+        self.max_bytes = max_bytes
+        self._entries = deque()
+        self._total_bytes = 0
+        self._last_seq = 0
+        self._changed = Condition(RLock())
+
+    def head(self):
+        with self._changed:
+            return self._last_seq
+
+    def publish(self, message):
+        data = json.dumps([message], separators=(",", ":"))
+        byte_len = len(data.encode("utf-8"))
+        kind = message.get("type")
+        kind = kind if kind in ("add", "delete", "update") else "unknown"
+        resource_types = {
+            "scene", "smart_scene", "light", "grouped_light", "room", "zone",
+            "device", "entertainment_configuration", "entertainment",
+            "behavior_instance", "geofence_client", "zigbee_connectivity",
+            "motion", "light_level", "temperature", "button", "device_power",
+            "relative_rotary", "zigbee_device_discovery",
+        }
+        refs = tuple(
+            f"{item.get('type') if item.get('type') in resource_types else 'unknown'}/{log_uuid(item.get('id'))}"
+            for item in message.get("data", [])
+        )
+        event_id = log_uuid(message.get("id"))
+        with self._changed:
+            while True:
+                head = self._last_seq
+                entry = StreamEntry(head + 1, f"{self.epoch}:{head + 1}",
+                                    data, byte_len, kind, refs, event_id)
+                # Allocation may run a finalizer that publishes under this RLock.
+                if self._last_seq == head:
+                    break
+            self._entries.append(entry)
+            self._last_seq = entry.seq
+            self._total_bytes += byte_len
+            while len(self._entries) > 1 and (
+                    len(self._entries) > self.max_events or self._total_bytes > self.max_bytes):
+                self._total_bytes -= self._entries.popleft().byte_len
+            self._changed.notify_all()
+        event_log(logging, 20 if kind in ("delete", "add") else 10, "event published",
+                  seq=entry.seq, sse_id=entry.sse_id, event_id=event_id,
+                  type=kind, resource=",".join(refs), status="published")
+        if byte_len > self.max_bytes:
+            event_log(logging, 30, "event oversized", seq=entry.seq,
+                      sse_id=entry.sse_id, type=kind, resource=",".join(refs),
+                      bytes=byte_len, max_bytes=self.max_bytes)
+        return entry
+
+    def resume(self, last_event_id):
+        req_seq = None
+        epoch = None
+        if isinstance(last_event_id, str) and len(last_event_id) <= 128:
+            match = re.fullmatch(r"([0-9]+):([0-9]+)", last_event_id)
+            if match:
+                epoch, req_seq = map(int, match.groups())
+        with self._changed:
+            head = self._last_seq
+            oldest = self._entries[0].seq if self._entries else head + 1
+        missed = 0
+        cursor = head
+        if last_event_id is None:
+            start = "live"
+        elif epoch is None:
+            start = "invalid_id"
+        elif epoch != self.epoch:
+            start = "gap_epoch"
+        elif req_seq > head:
+            start = "invalid_id"
+        elif req_seq < oldest - 1:
+            start = "gap_evicted"
+            missed = oldest - 1 - req_seq
+        else:
+            start = "replay"
+            cursor = req_seq
+        return Resume(cursor, start, req_seq, oldest, head, missed)
+
+    def wait_after(self, cursor, timeout):
+        with self._changed:
+            self._changed.wait_for(lambda: self._last_seq > cursor, timeout)
+            snapshot = tuple(self._entries)
+            head = self._last_seq
+        oldest = snapshot[0].seq if snapshot else head + 1
+        missed = max(0, oldest - 1 - cursor)
+        entries = () if missed else tuple(entry for entry in snapshot if entry.seq > cursor)
+        return Batch(entries, missed, oldest, head)
+
+
+events = EventJournal()
+
+
 def StreamEvent(message):
-    eventstream.append(message)
+    return events.publish(message)
+
+
+class AnnouncesDeletion:
+    def _init_deletion_lifecycle(self):
+        self._delete_announced = False
+        self._delete_lock = Lock()
+
+    def announce_deleted(self, source="v2"):
+        lock = getattr(self, "_delete_lock", None)
+        if lock is None:
+            return None
+        with lock:
+            if self._delete_announced:
+                return None
+            message = {
+                "creationtime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "data": [{"id": self.id_v2, "type": self.V2_TYPE}],
+                "id": str(uuid.uuid4()),
+                "type": "delete",
+                "id_v1": self.V1_PREFIX + self.id_v1,
+            }
+            entry = StreamEvent(message)
+            self._delete_announced = True
+        event_log(logging, 20, "scene delete_published", resource=self.V2_TYPE,
+                  rid=log_uuid(self.id_v2), seq=entry.seq, sse_id=entry.sse_id,
+                  event_id=entry.event_id, source=source, status="published")
+        return entry
+
+    def __del__(self):
+        self.announce_deleted(source="finalizer")
 
 def v1StateToV2(v1State):
     v2State = {}

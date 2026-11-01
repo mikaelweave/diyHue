@@ -2,11 +2,13 @@ import uuid
 import logManager
 from threading import Thread
 from datetime import datetime, timezone
-from HueObjects import genV2Uuid, StreamEvent
+from HueObjects import genV2Uuid, StreamEvent, AnnouncesDeletion
 
 logging = logManager.logger.get_logger(__name__)
 
-class SmartScene():
+class SmartScene(AnnouncesDeletion):
+    V2_TYPE = "smart_scene"
+    V1_PREFIX = "/smart_scene/"
 
     DEFAULT_SPEED = 60000#ms
 
@@ -33,16 +35,7 @@ class SmartScene():
                          }
         streamMessage["data"][0].update(self.getV2Api())
         StreamEvent(streamMessage)
-
-    def __del__(self):
-        streamMessage = {"creationtime": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                         "data": [{"id": self.id_v2, "type": "smart_scene"}],
-                         "id": str(uuid.uuid4()),
-                         "type": "delete"
-                         }
-        streamMessage["id_v1"] = "/smart_scene/" + self.id_v1
-        StreamEvent(streamMessage)
-        logging.info(self.name + " smart_scene was destroyed.")
+        self._init_deletion_lifecycle()
 
     def activate(self, data):
         # activate smart scene

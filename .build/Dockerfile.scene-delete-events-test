@@ -1,0 +1,2 @@
+FROM diyhue/core@sha256:85fc251c65ed71e116e2dbf045c59f92f88727faa065a75e9d6e532e065949af
+COPY BridgeEmulator/ /opt/hue-emulator/

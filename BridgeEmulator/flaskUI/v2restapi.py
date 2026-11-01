@@ -1,6 +1,6 @@
 import configManager
 import logManager
-from HueObjects import Group, EntertainmentConfiguration, Scene, BehaviorInstance, GeofenceClient, SmartScene, StreamEvent
+from HueObjects import Group, EntertainmentConfiguration, Scene, BehaviorInstance, GeofenceClient, SmartScene, StreamEvent, event_log, log_uuid
 import uuid
 import json
 import weakref
@@ -8,7 +8,7 @@ from flask_restful import Resource
 from flask import request
 from services.entertainment import entertainmentService
 from services.updateManager import bridge_software_version
-from threading import Thread
+from threading import Thread, Lock
 from time import sleep
 from functions.core import nextFreeId
 from datetime import datetime, timezone
@@ -23,6 +23,40 @@ bridgeConfig = configManager.bridgeConfig.yaml_config
 v2Resources = {"light": {}, "scene": {}, "smart_scene": {}, "grouped_light": {}, "room": {}, "zone": {
 }, "entertainment": {}, "entertainment_configuration": {}, "zigbee_connectivity": {}, "zigbee_device_discovery": {}, "device": {}, "device_power": {},
 "geofence_client": {}, "motion": {}, "light_level": {}, "temperature": {}, "relative_rotary": {}, "button": {}}
+
+SCENE_STORES = {"scene": "scenes", "smart_scene": "smart_scene"}
+_SCENE_DELETE_LOCK = Lock()
+
+
+def deleteScene(resource, resourceid):
+    store = SCENE_STORES[resource]
+    with _SCENE_DELETE_LOCK:
+        bucket = bridgeConfig[store]
+        removed = None
+        for key, candidate in list(bucket.items()):
+            if candidate.id_v2 == resourceid:
+                if bucket.get(key) is candidate:
+                    popped = bucket.pop(key, None)
+                    if popped is candidate:
+                        removed = popped
+                break
+        v2Resources[resource].pop(resourceid, None)
+        if removed is not None:
+            entry = removed.announce_deleted(source="v2")
+            configManager.bridgeConfig.mark_dirty(store)
+    fields = {"resource": resource, "rid": log_uuid(resourceid), "source": "v2"}
+    if removed is None:
+        event_log(logging, 20, "scene delete", **fields, status=404)
+        return {"errors": [{"description": "Not Found"}], "data": []}, 404
+    fields.update(seq=entry.seq if entry else "-", sse_id=entry.sse_id if entry else "-",
+                  event_id=entry.event_id if entry else "-")
+    try:
+        configManager.bridgeConfig.save_config(backup=False, resource=store)
+    except Exception:
+        event_log(logging, 20, "scene delete", **fields, status="error", save_call="failed")
+        raise
+    event_log(logging, 20, "scene delete", **fields, status=200, save_call="returned")
+    return {"data": [{"rid": resourceid, "rtype": resource}]}
 
 
 def stopSmartScenesOn(group):
@@ -806,6 +840,8 @@ class ClipV2ResourceId(Resource):
         authorisation = authorizeV2(request.headers)
         if "user" not in authorisation:
             return "", 403
+        if resource in SCENE_STORES:
+            return deleteScene(resource, resourceid)
         object = getObject(resource, resourceid)
 
         if hasattr(object, 'getObjectPath'):
@@ -820,14 +856,8 @@ class ClipV2ResourceId(Resource):
             if yaml_resource:
                 configManager.bridgeConfig.mark_dirty(yaml_resource)
 
-        # Persist deletions immediately for resources whose in-memory state must
-        # survive a bridge restart (scenes, behavior instances).
         if resource == "behavior_instance":
             configManager.bridgeConfig.save_config(backup=False, resource="behavior_instance")
-        elif resource == "scene":
-            configManager.bridgeConfig.save_config(backup=False, resource="scenes")
-        elif resource == "smart_scene":
-            configManager.bridgeConfig.save_config(backup=False, resource="smart_scene")
 
         response = {"data": [{
             "rid": resourceid,
